@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import pytest
+import requests
 from conftest import (
     FakeAgent,
     FakeContext,
     FakeExplore,
     FakeGoldenQuery,
     FakeLookerSDK,
+    FakeSDKError,
     FakeSource,
 )
 
@@ -229,4 +234,96 @@ def test_extract_populates_golden_query_record_fields_and_deduplicates(
     assert gq1.golden_query_id.startswith("h_")
     assert gq1.record_id == f"agent-eng-001:{gq1.golden_query_id}"
     assert "LookML Explore: engineering_analytics.issue" in gq1.metadata_concat
+
+
+def test_fetch_user_accessible_agents_with_user_id_sudo_and_logout_on_error(
+    sample_sync_config: SyncConfig,
+) -> None:
+    """Verify `fetch_user_accessible_agents(user_id=...)` uses `auth.login_user`/`logout` and captures warnings."""
+    agents = [
+        FakeAgent(id="agent-1", name="Agent 1", deleted=False, has_inaccessible_source=False),
+        FakeAgent(id="agent-1", name="Agent 1 Dup", deleted=False, has_inaccessible_source=False),
+        FakeAgent(id="agent-2", name="Agent 2 Partial", deleted=False, has_inaccessible_source=True),
+        FakeAgent(id="agent-deleted", name="Deleted", deleted=True, has_inaccessible_source=True),
+    ]
+    fake_sdk = FakeLookerSDK(agents=agents)
+    extractor = LookerAgentExtractor(config=sample_sync_config, sdk=fake_sdk)
+
+    access = extractor.fetch_user_accessible_agents(user_id="42")
+
+    assert access.mode == "user_id"
+    assert access.user_id == "42"
+    assert access.allowed_agent_ids == ["agent-1", "agent-2"]
+    assert access.inaccessible_source_agent_ids == ["agent-2"]
+    assert fake_sdk.auth.login_user_calls == [42]
+    assert fake_sdk.auth.logout_calls == 1
+    assert fake_sdk.auth.active_sudo_user is None
+    assert fake_sdk.search_calls == [
+        {"deleted": False, "fields": "id,deleted,has_inaccessible_source"}
+    ]
+
+    # Verify auth.logout() is ALWAYS called even if search_agents raises an exception
+    err_sdk = FakeLookerSDK(agents=agents, search_error=FakeSDKError("Forbidden", status=403))
+    err_extractor = LookerAgentExtractor(config=sample_sync_config, sdk=err_sdk)
+    with pytest.raises(FakeSDKError):
+        err_extractor.fetch_user_accessible_agents(user_id="99")
+    assert err_sdk.auth.login_user_calls == [99]
+    assert err_sdk.auth.logout_calls == 1
+    assert err_sdk.auth.active_sudo_user is None
+
+
+def test_fetch_user_accessible_agents_with_access_token_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `fetch_user_accessible_agents(access_token=...)` calls Bearer endpoint without client_id/secret."""
+    cfg_no_client_creds = SyncConfig(
+        looker_base_url="https://looker.example.com",
+        looker_client_id="",
+        looker_client_secret="",
+        looker_verify_ssl="true",
+        looker_timeout="60",
+        project_id="test-gcp-project",
+    )
+    captured_requests: list[dict[str, Any]] = []
+
+    class _FakeRequestsResp:
+        status_code = 200
+        text = "OK"
+
+        def json(self) -> list[dict[str, Any]]:
+            return [
+                {"id": "agent-a", "deleted": False, "has_inaccessible_source": False},
+                {"id": "agent-b", "deleted": False, "has_inaccessible_source": True},
+                {"id": "agent-a", "deleted": False, "has_inaccessible_source": False},
+                {"id": "agent-del", "deleted": True, "has_inaccessible_source": True},
+            ]
+
+    def _fake_requests_get(url: str, **kwargs: Any) -> _FakeRequestsResp:
+        captured_requests.append({"url": url, **kwargs})
+        return _FakeRequestsResp()
+
+    monkeypatch.setattr(requests, "get", _fake_requests_get)
+
+    extractor = LookerAgentExtractor(config=cfg_no_client_creds, sdk=None)
+    access = extractor.fetch_user_accessible_agents(access_token="oauth_token_xyz")
+
+    assert access.mode == "access_token"
+    assert access.user_id is None
+    assert access.allowed_agent_ids == ["agent-a", "agent-b"]
+    assert access.inaccessible_source_agent_ids == ["agent-b"]
+    assert len(captured_requests) == 1
+    assert captured_requests[0]["url"] == "https://looker.example.com/api/4.0/agents/search"
+    assert captured_requests[0]["headers"] == {"Authorization": "Bearer oauth_token_xyz"}
+    assert captured_requests[0]["params"] == {
+        "deleted": "false",
+        "fields": "id,deleted,has_inaccessible_source",
+    }
+
+    # Verify error when both or neither are passed
+    with pytest.raises(ValueError, match="Exactly one of `user_id` or `access_token`"):
+        extractor.fetch_user_accessible_agents(user_id="42", access_token="oauth_token_xyz")
+
+    with pytest.raises(ValueError, match="Exactly one of `user_id` or `access_token`"):
+        extractor.fetch_user_accessible_agents(user_id=None, access_token=None)
+
 

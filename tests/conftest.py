@@ -48,6 +48,7 @@ class FakeAgent:
     golden_queries: Optional[list[FakeGoldenQuery]] = field(default_factory=list)
     context: Optional[FakeContext] = None
     deleted: Optional[bool] = False
+    has_inaccessible_source: Optional[bool] = False
     code_interpreter: Optional[bool] = False
     created_by_name: Optional[str] = "Alice Engineer"
     created_at: Optional[Any] = field(
@@ -77,26 +78,49 @@ class FakeSDKError(Exception):
         self.status = status
 
 
+class FakeAuth:
+    """Simulates `sdk.auth` for sudo (`login_user` / `logout`) tracking."""
+
+    def __init__(self) -> None:
+        self.login_user_calls: list[Any] = []
+        self.logout_calls: int = 0
+        self.active_sudo_user: Optional[Any] = None
+
+    def login_user(self, user_id: Any) -> None:
+        self.login_user_calls.append(user_id)
+        self.active_sudo_user = user_id
+
+    def logout(self) -> None:
+        self.logout_calls += 1
+        self.active_sudo_user = None
+
+
 class FakeLookerSDK:
-    """In-memory fake of Looker 4.0 SDK tracking read-only API calls."""
+    """In-memory fake of Looker 4.0 SDK tracking read-only API calls and sudo auth."""
 
     def __init__(
         self,
         agents: Optional[list[FakeAgent]] = None,
         explores: Optional[dict[tuple[str, str], FakeExplore]] = None,
+        search_error: Optional[Exception] = None,
     ) -> None:
-        self.agents_by_id: dict[str, FakeAgent] = {a.id: a for a in (agents or []) if a.id}
+        self._agents_list: list[FakeAgent] = list(agents or [])
+        self.agents_by_id: dict[str, FakeAgent] = {a.id: a for a in self._agents_list if a.id}
         self.explores_by_pair: dict[tuple[str, str], FakeExplore] = dict(explores or {})
         self.search_calls: list[dict[str, Any]] = []
         self.get_agent_calls: list[str] = []
         self.explore_calls: list[tuple[str, str, Optional[str]]] = []
+        self.auth = FakeAuth()
+        self.search_error = search_error
 
     def me(self, fields: Optional[str] = None) -> dict[str, Any]:
         return {"id": "1", "display_name": "Test Looker User"}
 
     def search_agents(self, deleted: Optional[bool] = None, **kwargs: Any) -> list[FakeAgent]:
         self.search_calls.append({"deleted": deleted, **kwargs})
-        results = list(self.agents_by_id.values())
+        if self.search_error is not None:
+            raise self.search_error
+        results = list(self._agents_list)
         if deleted is False:
             results = [a for a in results if not a.deleted]
         return results

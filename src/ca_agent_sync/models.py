@@ -480,6 +480,15 @@ class StatusReport(BaseModel):
     golden_queries_errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class UserAgentAccess(BaseModel):
+    """User's accessible CA agents resolved from Looker via sudo or access token."""
+
+    mode: str = "admin"
+    user_id: Optional[str] = None
+    allowed_agent_ids: list[str] = Field(default_factory=list)
+    inaccessible_source_agent_ids: list[str] = Field(default_factory=list)
+
+
 class SearchHit(BaseModel):
     """Single semantic vector search result from BigQuery `ca_agents`."""
 
@@ -495,6 +504,8 @@ class SearchHit(BaseModel):
     explores: list[str] = Field(default_factory=list)
     sources: list[dict[str, Any]] = Field(default_factory=list)
     embedding_source: str = "STORED"
+    has_inaccessible_source: bool = False
+    warning: Optional[str] = None
 
 
 class GoldenQuerySearchHit(BaseModel):
@@ -518,6 +529,8 @@ class GoldenQuerySearchHit(BaseModel):
     similarity_score: float
     distance: float
     embedding_source: str = "STORED"
+    has_inaccessible_source: bool = False
+    warning: Optional[str] = None
 
 
 class TwoStepSearchResult(BaseModel):
@@ -533,4 +546,8 @@ class TwoStepSearchResult(BaseModel):
     matched_agent_ids: list[str] = Field(default_factory=list)
     golden_query_results: list[GoldenQuerySearchHit] = Field(default_factory=list)
     results: list[SearchHit] = Field(default_factory=list)
+    authz_mode: str = "admin"
+    user_id: Optional[str] = None
+    allowed_agent_count: Optional[int] = None
+
 

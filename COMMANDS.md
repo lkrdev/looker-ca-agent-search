@@ -1,8 +1,8 @@
 # `ca-agent-sync` CLI Command Reference (`COMMANDS.md`)
 
-Complete reference for the `ca-agent-sync` Python CLI service, which synchronizes Looker Conversational Analytics (CA) agents and their Golden Queries into two Google Cloud BigQuery Autonomous Embedding tables (`ca_agents` and `ca_golden_queries`) and performs single-step or two-step candidate-filtered semantic vector routing.
+Complete reference for the `ca-agent-sync` Python CLI service, which synchronizes Looker Conversational Analytics (CA) agents and their Golden Queries into two Google Cloud BigQuery Autonomous Embedding tables (`ca_agents` and `ca_golden_queries`) and performs single-step or two-step candidate-filtered semantic vector routing—with optional multi-tenant / user-scoped authorization (`--user-id` or `--access-token`).
 
-For architecture diagrams, IAM setup, BigQuery table schemas/DDLs, and SQL query examples, see [**`README.md`**](README.md).
+For architecture diagrams, IAM setup, BigQuery table schemas/DDLs, SQL query examples, and [**Multi-Tenant & User-Scoped Search Architecture (Important Callouts)**](README.md#2-multi-tenant--user-scoped-search-architecture-important-callouts), see [**`README.md`**](README.md).
 
 ---
 
@@ -19,6 +19,7 @@ For architecture diagrams, IAM setup, BigQuery table schemas/DDLs, and SQL query
    - [7.2 Two-Step Golden Query + Agent Candidate-Filtered Search](#72-two-step-golden-query--agent-candidate-filtered-search)
    - [7.3 Two-Step Search with Stage 1 Early Exit (`--stop-on-golden-match`)](#73-two-step-search-with-stage-1-early-exit---stop-on-golden-match)
    - [7.4 Two-Step Search with Stage 1 Miss (Unfiltered Stage 2 Fallback)](#74-two-step-search-with-stage-1-miss-unfiltered-stage-2-fallback)
+   - [7.5 Multi-Tenant / User-Scoped Search (`--user-id` & `--access-token`) & Partial Source Access Warnings](#75-multi-tenant--user-scoped-search---user-id----access-token--partial-source-access-warnings)
 8. [Exit Codes & Error Handling](#8-exit-codes--error-handling)
 
 ---
@@ -56,11 +57,12 @@ At startup, `ca-agent-sync` loads `.env` (or the file specified via `--env-file`
 
 | Environment Variable | Required | Default | Description |
 | :--- | :---: | :--- | :--- |
-| `LOOKERSDK_BASE_URL` | Yes (for `sync`) | `https://your-instance.cloud.looker.com` | Base URL of the Looker instance. |
-| `LOOKERSDK_CLIENT_ID` | Yes (for `sync`) | — | Looker API3 Client ID (read-only access to CA agents & LookML Explores). |
-| `LOOKERSDK_CLIENT_SECRET` | Yes (for `sync`) | — | Looker API3 Client Secret. |
+| `LOOKERSDK_BASE_URL` | Yes (for `sync` & user-scoped `search`) | `https://your-instance.cloud.looker.com` | Base URL of the Looker instance. |
+| `LOOKERSDK_CLIENT_ID` | Yes (for `sync` & `search --user-id`) | — | Looker API3 Client ID (read-only access to CA agents & LookML Explores; `login_user` sudo permission required for `search --user-id`). Not required when using `search --access-token`. |
+| `LOOKERSDK_CLIENT_SECRET` | Yes (for `sync` & `search --user-id`) | — | Looker API3 Client Secret. Not required when using `search --access-token`. |
 | `LOOKERSDK_VERIFY_SSL` | No | `true` | Whether to verify TLS/SSL certificates when connecting to Looker. |
 | `LOOKERSDK_TIMEOUT` | No | `120` | Looker HTTP request timeout in seconds. |
+| `LOOKER_ACCESS_TOKEN` | No | — | Optional Looker user OAuth or session Bearer token for user-scoped search (equivalent to passing `--access-token` to `ca-agent-sync search`). |
 | `CA_AGENT_SYNC_PROJECT_ID` | No | `<YOUR_GCP_PROJECT_ID>` | Target Google Cloud project ID hosting BigQuery and Vertex AI. |
 | `CA_AGENT_SYNC_LOCATION` | No | `US` | BigQuery dataset and Cloud Resource Connection location. |
 | `CA_AGENT_SYNC_DATASET` | No | `looker_agent_registry` | BigQuery dataset name. |
@@ -72,12 +74,15 @@ At startup, `ca-agent-sync` loads `.env` (or the file specified via `--env-file`
 ### Example `.env` File
 
 ```dotenv
-# Looker Python SDK Credentials (Required for `sync`)
+# Looker Python SDK Credentials (Required for `sync` and `search --user-id`)
 LOOKERSDK_BASE_URL=https://your-instance.cloud.looker.com
 LOOKERSDK_CLIENT_ID=your_looker_client_id
 LOOKERSDK_CLIENT_SECRET=your_looker_client_secret
 LOOKERSDK_VERIFY_SSL=true
 LOOKERSDK_TIMEOUT=120
+
+# Optional: Looker User OAuth / Session Token for User-Scoped Search (`search --access-token`)
+# LOOKER_ACCESS_TOKEN=eyJhbGciOi...
 
 # Google Cloud / BigQuery Autonomous Embedding Target Defaults (Optional Overrides)
 CA_AGENT_SYNC_PROJECT_ID=<YOUR_GCP_PROJECT_ID>
@@ -384,22 +389,29 @@ uv run ca-agent-sync status --json
 Routes a natural language `<question>` to the best Looker CA agent(s) using BigQuery semantic vector search (`AI.SEARCH` when all autonomous embeddings are populated, with automatic fallback to `AI.EMBED` + `ML.DISTANCE(..., 'COSINE')` when background generation is still pending for newly synced rows).
 
 Supports two routing modes:
-1. **Single-Step Agent Search** (default when `--golden-queries` is omitted): Searches `ca_agents` directly across all agents.
+1. **Single-Step Agent Search** (default when `--golden-queries` is omitted): Searches `ca_agents` directly across all accessible agents.
 2. **Two-Step Golden Query + Agent Candidate-Filtered Search** (enabled when `--golden-queries` / `-g` is passed):
-   - **Stage 1 (`ca_golden_queries`)**: Pulls the top `--golden-queries=<N>` Golden Query matches and filters them against `--confidence_score` (or `--confidence-score` / `-c`, defaulting to `0.60`, validated in `[0.0, 1.0]`).
+   - **Stage 1 (`ca_golden_queries`)**: Pulls the top `--golden-queries=<N>` Golden Query matches (pre-filtered to `@allowed_agent_ids` when user-scoped) and filters them against `--confidence_score` (or `--confidence-score` / `-c`, defaulting to `0.60`, validated in `[0.0, 1.0]`).
    - **Stage 2 (`ca_agents`)**:
-     - If $\ge 1$ Golden Queries have `similarity_score >= confidence_score`: Returns those matched Golden Queries and (unless `--stop-on-golden-match` is set) searches `ca_agents` **strictly filtered to the distinct `agent_id`s from those matched Golden Queries** (`WHERE agent_id IN UNNEST(@matched_agent_ids)`).
-     - If $0$ Golden Queries meet `confidence_score`: Returns no Golden Queries (`golden_query_results: []`) and falls back to an **unfiltered** Stage 2 search across all rows in `ca_agents`.
+     - If $\ge 1$ Golden Queries have `similarity_score >= confidence_score`: Returns those matched Golden Queries and (unless `--stop-on-golden-match` is set) searches `ca_agents` **strictly filtered to the distinct `agent_id`s from those matched Golden Queries** (`WHERE agent_id IN UNNEST(@matched_agent_ids)`, intersected with `@allowed_agent_ids` when user-scoped).
+     - If $0$ Golden Queries meet `confidence_score`: Returns no Golden Queries (`golden_query_results: []`) and falls back to a Stage 2 search across `ca_agents` (pre-filtered to `@allowed_agent_ids` when user-scoped, or across all rows in `ca_agents` in Admin mode).
+
+Supports three authorization scopes (mutually exclusive):
+- **Admin / Global Mode (Default)**: When neither `--user-id` nor `--access-token` is provided (`authz_mode: "admin"`), searches across all synced rows in `ca_agents` and `ca_golden_queries`.
+- **User-Scoped via Admin Sudo (`--user-id`, `-u <LOOKER_USER_ID>`)**: Impersonates a target Looker user using the Admin credentials in `.env` (`POST /api/4.0/login/{user_id}`), fetches only the CA agents that user has access to (`GET /api/4.0/agents/search`), logs out the temporary sudo session, and pre-filters BigQuery vector search (`Stage 1` Golden Queries and `Stage 2` Agents) to that user's allowlist (`authz_mode: "user_id"`).
+- **User-Scoped via Bearer Token (`--access-token <TOKEN>` or `LOOKER_ACCESS_TOKEN`)**: Passes a target user's Looker OAuth or session access token directly to `GET /api/4.0/agents/search` (`Authorization: Bearer <TOKEN>`) **without requiring Admin client credentials (`LOOKERSDK_CLIENT_ID` / `LOOKERSDK_CLIENT_SECRET`) on the search caller**, then pre-filters BigQuery vector search to those accessible agents (`authz_mode: "access_token"`).
 
 ### Flags & Arguments for `search`
 
-| Argument / Flag | Aliases | Type | Default | Description |
+| Argument / Flag | Aliases / Env Var | Type | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `QUESTION` *(Positional)* | — | `TEXT` | *Required* | Natural language question to route to the best Looker CA agent. |
 | `--top-k` | `-k` | `INTEGER` | `5` | Number of top matching agents to return (`1..100`). |
 | `--golden-queries` | `-g` | `INTEGER` | `None` | Enable Two-Step Search: number of Stage 1 Golden Query embeddings to pull from `ca_golden_queries` (`1..100`). |
 | `--confidence_score` | `--confidence-score`, `-c` | `FLOAT` | `0.60` | Minimum cosine similarity score in `[0.0, 1.0]` for Stage 1 Golden Query matches (active when `--golden-queries` is specified). |
 | `--stop-on-golden-match` | — | `FLAG` | `False` | Stop after Stage 1 and return matched Golden Queries without querying `ca_agents` if $\ge 1$ Golden Queries meet `confidence_score`. |
+| `--user-id` | `-u` | `TEXT` | `None` | Looker user ID to sudo as (via Admin credentials in `.env`, `POST /api/4.0/login/{user_id}`) so only CA agents accessible to that user are searched. Mutually exclusive with `--access-token`. |
+| `--access-token` | `LOOKER_ACCESS_TOKEN` | `TEXT` | `None` | Looker user access token (OAuth or session Bearer token) to fetch only CA agents accessible to that user (`GET /api/4.0/agents/search`) without requiring Admin client credentials. Mutually exclusive with `--user-id`. |
 | `--project-id` | `--project` | `TEXT` | `<YOUR_GCP_PROJECT_ID>` | Google Cloud project ID. |
 | `--location` | — | `TEXT` | `US` | BigQuery dataset/connection location. |
 | `--dataset` | — | `TEXT` | `looker_agent_registry` | BigQuery dataset name. |
@@ -431,6 +443,9 @@ uv run ca-agent-sync search "What is our sprint velocity and SLA compliance rate
   "status": "ok",
   "question": "What is our sprint velocity and SLA compliance rate for engineering issues?",
   "top_k": 3,
+  "authz_mode": "admin",
+  "user_id": null,
+  "allowed_agent_count": null,
   "results": [
     {
       "rank": 1,
@@ -458,7 +473,9 @@ uv run ca-agent-sync search "What is our sprint velocity and SLA compliance rate
           "name": "issue"
         }
       ],
-      "embedding_source": "STORED"
+      "embedding_source": "STORED",
+      "has_inaccessible_source": false,
+      "warning": null
     }
   ]
 }
@@ -499,6 +516,9 @@ Matches the exact `TwoStepSearchResult` schema:
   "matched_agent_ids": [
     "agent-eng-001"
   ],
+  "authz_mode": "admin",
+  "user_id": null,
+  "allowed_agent_count": null,
   "golden_query_results": [
     {
       "rank": 1,
@@ -530,7 +550,9 @@ Matches the exact `TwoStepSearchResult` schema:
       "answer": null,
       "similarity_score": 0.841205,
       "distance": 0.158795,
-      "embedding_source": "STORED"
+      "embedding_source": "STORED",
+      "has_inaccessible_source": false,
+      "warning": null
     }
   ],
   "results": [
@@ -560,7 +582,9 @@ Matches the exact `TwoStepSearchResult` schema:
           "name": "project"
         }
       ],
-      "embedding_source": "STORED"
+      "embedding_source": "STORED",
+      "has_inaccessible_source": false,
+      "warning": null
     }
   ]
 }
@@ -595,6 +619,9 @@ uv run ca-agent-sync search "What is the status and completion progress of all s
   "matched_agent_ids": [
     "agent-eng-001"
   ],
+  "authz_mode": "admin",
+  "user_id": null,
+  "allowed_agent_count": null,
   "golden_query_results": [
     {
       "rank": 1,
@@ -626,7 +653,9 @@ uv run ca-agent-sync search "What is the status and completion progress of all s
       "answer": null,
       "similarity_score": 0.841205,
       "distance": 0.158795,
-      "embedding_source": "STORED"
+      "embedding_source": "STORED",
+      "has_inaccessible_source": false,
+      "warning": null
     }
   ],
   "results": []
@@ -637,7 +666,7 @@ uv run ca-agent-sync search "What is the status and completion progress of all s
 
 ### 7.4 Two-Step Search with Stage 1 Miss (Unfiltered Stage 2 Fallback)
 
-When 0 Golden Queries meet `confidence_score` (for example, when `--confidence_score=0.99`), Stage 1 returns no Golden Queries (`golden_query_matched: false`, `golden_query_results: []`) and Stage 2 automatically runs an **unfiltered** semantic vector search across all agents in `ca_agents` (`stage2_filtered: false`).
+When 0 Golden Queries meet `confidence_score` (for example, when `--confidence_score=0.99`), Stage 1 returns no Golden Queries (`golden_query_matched: false`, `golden_query_results: []`) and Stage 2 automatically runs an **unfiltered** semantic vector search across all agents in `ca_agents` (`stage2_filtered: false`—or pre-filtered to `@allowed_agent_ids` when `--user-id` / `--access-token` is active).
 
 ```bash
 # Two-step search where 0 Golden Queries meet confidence_score=0.99 -> unfiltered Stage 2 fallback
@@ -667,6 +696,9 @@ uv run ca-agent-sync search "What is our sprint velocity and SLA compliance rate
   "golden_query_matched": false,
   "stage2_filtered": false,
   "matched_agent_ids": [],
+  "authz_mode": "admin",
+  "user_id": null,
+  "allowed_agent_count": null,
   "golden_query_results": [],
   "results": [
     {
@@ -695,7 +727,144 @@ uv run ca-agent-sync search "What is our sprint velocity and SLA compliance rate
           "name": "issue"
         }
       ],
-      "embedding_source": "STORED"
+      "embedding_source": "STORED",
+      "has_inaccessible_source": false,
+      "warning": null
+    }
+  ]
+}
+```
+
+---
+
+### 7.5 Multi-Tenant / User-Scoped Search (`--user-id` & `--access-token`) & Partial Source Access Warnings
+
+> **Full Architectural Details**: See [**Multi-Tenant & User-Scoped Search Architecture (Important Callouts)**](README.md#2-multi-tenant--user-scoped-search-architecture-important-callouts) in `README.md` for complete architectural guidance.
+
+To ensure search only returns CA agents that a specific target Looker user is authorized to access—while maintaining a single global set of embeddings in BigQuery—pass either `--user-id` (`-u`) or `--access-token` (`LOOKER_ACCESS_TOKEN`):
+
+1. **`--user-id`, `-u <LOOKER_USER_ID>` (Admin Sudo Impersonation)**:
+   - Uses the Admin credentials in `.env` (`LOOKERSDK_CLIENT_ID` / `LOOKERSDK_CLIENT_SECRET`) to impersonate the target Looker user (`POST /api/4.0/login/{user_id}` via `sdk.auth.login_user(user_id)`).
+   - Fetches only the CA agents that user has access to (`GET /api/4.0/agents/search?deleted=false&fields=id,deleted,has_inaccessible_source`), guarantees `sdk.auth.logout()` of the sudo session, and pre-filters BigQuery vector search (`Stage 1` Golden Queries and `Stage 2` Agents) to that user's allowlist (`WHERE agent_id IN UNNEST(@allowed_agent_ids)`).
+   - **Looker Core Nuance**: On **Looker (Google Cloud core)**, `login_user` (`--user-id` sudo) is only permitted when the Admin credentials belong to an **API-only Service Account** and the target user is an **Embed User**. For regular Looker Core users (authenticated via Google OAuth), pass their OAuth token via `--access-token` / `LOOKER_ACCESS_TOKEN`.
+2. **`--access-token <TOKEN>` / `LOOKER_ACCESS_TOKEN` (Direct User Bearer Token)**:
+   - Passes a target user's Looker OAuth or session access token directly to `GET /api/4.0/agents/search` (`Authorization: Bearer <TOKEN>`) **without requiring Admin client credentials (`LOOKERSDK_CLIENT_ID` / `LOOKERSDK_CLIENT_SECRET`) on the search caller** (only `LOOKERSDK_BASE_URL` is needed), then pre-filters BigQuery vector search to those accessible agents.
+3. **Partial Source Access Warning (`has_inaccessible_source`)**:
+   - If a user has access to a CA agent in Looker, that agent is **included** in search results even if `has_inaccessible_source=true` (because the agent may have multiple LookML Explores/sources that the user *can* access).
+   - Both the human CLI output and `--json` output surface an explicit warning on matching Agent and Golden Query hits:
+     - `has_inaccessible_source`: `true`
+     - `warning`: `"User lacks access to one or more LookML sources on this agent; some queries may fail."`
+4. **Viewer Disclosure Policy**:
+   - Viewer users who have access to an agent in Looker (`can.show` / `can.chat`) can see full Golden Query and agent metadata in search results.
+5. **Single Instance & Direct BigQuery SQL Consumers**:
+   - Each BigQuery dataset/table pair (`ca_agents` and `ca_golden_queries`) is scoped to a **single Looker instance** and stores the global Admin-synced catalog without BigQuery Row-Level Security (RLS). Any downstream applications or analysts querying BigQuery directly via SQL (outside `ca-agent-sync search`) will see all synced agents unless they apply their own Looker allowlist filter (`WHERE agent_id IN UNNEST(@allowed_agent_ids)`).
+
+#### Copy-Pasteable User-Scoped Search Examples
+
+```bash
+# 1. User-scoped two-step search via Admin sudo (--user-id / -u)
+uv run ca-agent-sync search "What is the status and completion progress of all strategic projects?" \
+  --user-id 42 \
+  --golden-queries=5 \
+  --confidence_score=0.65 \
+  --top-k 3
+
+# 2. User-scoped single-step search via direct user OAuth / session Bearer token (--access-token)
+uv run ca-agent-sync search "What is our sprint velocity and SLA compliance rate for engineering issues?" \
+  --access-token "eyJhbGciOi..." \
+  --top-k 3 \
+  --json
+
+# 3. User-scoped search using the LOOKER_ACCESS_TOKEN environment variable
+LOOKER_ACCESS_TOKEN="eyJhbGciOi..." uv run ca-agent-sync search \
+  "What is the status and completion progress of all strategic projects?" \
+  -g 5 -c 0.65 -k 3 --json
+```
+
+#### Sample `--json` Output (User-Scoped Two-Step Search with `has_inaccessible_source` Warning)
+
+```json
+{
+  "status": "ok",
+  "question": "What is the status and completion progress of all strategic projects?",
+  "top_k": 3,
+  "golden_queries_requested": 5,
+  "confidence_score": 0.65,
+  "stop_on_golden_match": false,
+  "golden_query_matched": true,
+  "stage2_filtered": true,
+  "matched_agent_ids": [
+    "agent-eng-001"
+  ],
+  "authz_mode": "user_id",
+  "user_id": "42",
+  "allowed_agent_count": 2,
+  "golden_query_results": [
+    {
+      "rank": 1,
+      "record_id": "agent-eng-001:1",
+      "golden_query_id": "1",
+      "agent_id": "agent-eng-001",
+      "agent_name": "Engineering Intelligence Assistant",
+      "agent_url": "https://your-instance.cloud.looker.com/extensions/conversational_analytics::conversational_analytics/agents/agent-eng-001",
+      "instance_url": "https://your-instance.cloud.looker.com",
+      "questions": [
+        "What is the status and completion progress of all strategic projects?"
+      ],
+      "model": "engineering_analytics",
+      "explore": "project",
+      "fields": [
+        "project.name",
+        "team.name",
+        "lead.name",
+        "project_status.name",
+        "project.state",
+        "project_metrics_rollup.latest_health_status",
+        "project.progress"
+      ],
+      "filters": {},
+      "sorts": [
+        "project.progress desc"
+      ],
+      "limit": null,
+      "answer": null,
+      "similarity_score": 0.841205,
+      "distance": 0.158795,
+      "embedding_source": "STORED",
+      "has_inaccessible_source": true,
+      "warning": "User lacks access to one or more LookML sources on this agent; some queries may fail."
+    }
+  ],
+  "results": [
+    {
+      "rank": 1,
+      "agent_id": "agent-eng-001",
+      "name": "Engineering Intelligence Assistant",
+      "description": "AI Conversational Analytics Assistant for engineering_analytics",
+      "category": null,
+      "similarity_score": 0.752104,
+      "distance": 0.247896,
+      "agent_url": "https://your-instance.cloud.looker.com/extensions/conversational_analytics::conversational_analytics/agents/agent-eng-001",
+      "instance_url": "https://your-instance.cloud.looker.com",
+      "explores": [
+        "engineering_analytics.comment",
+        "engineering_analytics.issue",
+        "engineering_analytics.issue_history",
+        "engineering_analytics.issue_labels",
+        "engineering_analytics.project"
+      ],
+      "sources": [
+        {
+          "description": "Project roadmap and health status.",
+          "explore": "project",
+          "label": "Strategic Projects",
+          "model": "engineering_analytics",
+          "name": "project"
+        }
+      ],
+      "embedding_source": "STORED",
+      "has_inaccessible_source": true,
+      "warning": "User lacks access to one or more LookML sources on this agent; some queries may fail."
     }
   ]
 }
@@ -708,5 +877,5 @@ uv run ca-agent-sync search "What is our sprint velocity and SLA compliance rate
 | Exit Code | Meaning | Example Cause |
 | :---: | :--- | :--- |
 | `0` | Success | Command completed normally. |
-| `1` | Runtime / Infrastructure Error | Looker API authentication error, BigQuery permission error, or missing `embedding` column in `INFORMATION_SCHEMA.COLUMNS`. |
-| `2` | CLI Usage / Validation Error | Passing both or neither of `--batch` and `--agent-id` to `sync`, or passing `--confidence_score` outside `[0.0, 1.0]`. |
+| `1` | Runtime / Infrastructure Error | Looker API authentication/sudo error, BigQuery permission error, or missing `embedding` column in `INFORMATION_SCHEMA.COLUMNS`. |
+| `2` | CLI Usage / Validation Error | Passing both or neither of `--batch` and `--agent-id` to `sync`, passing both `--user-id` and `--access-token` to `search`, or passing `--confidence_score` outside `[0.0, 1.0]`. |

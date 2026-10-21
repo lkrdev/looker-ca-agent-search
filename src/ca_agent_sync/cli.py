@@ -15,10 +15,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from ca_agent_sync.bigquery_sync import BigQueryAgentSync
+from ca_agent_sync.bigquery_sync import INACCESSIBLE_SOURCE_WARNING, BigQueryAgentSync
 from ca_agent_sync.config import SyncConfig
 from ca_agent_sync.looker_extractor import LookerAgentExtractor
-from ca_agent_sync.models import GoldenQuerySearchHit, SearchHit, SyncResult
+from ca_agent_sync.models import GoldenQuerySearchHit, SearchHit, SyncResult, UserAgentAccess
 
 app = typer.Typer(
     name="ca-agent-sync",
@@ -39,14 +39,15 @@ def _emit_json(payload: object) -> None:
     typer.echo(json.dumps(payload, indent=2, default=str))
 
 
-def _render_agent_hits_table(question: str, hits: Sequence[SearchHit], title_prefix: str = "") -> None:
+def _render_agent_hits_table(
+    question: str, hits: Sequence[SearchHit], title_prefix: str = ""
+) -> None:
     """Render a Rich table of Stage 2 CA Agent search hits."""
     if not hits:
         out_console.print("[yellow]No matching CA agents found in BigQuery.[/yellow]")
         return
 
-    prefix = f"{title_prefix}" if title_prefix else ""
-    tbl = Table(title=f'{prefix}Top {len(hits)} Matching Looker CA Agents for: "{question}"')
+    tbl = Table(title=f'{title_prefix}Top {len(hits)} Matching Looker CA Agents for: "{question}"')
     tbl.add_column("Rank", justify="right", style="cyan")
     tbl.add_column("Similarity", justify="right", style="green")
     tbl.add_column("Agent Name & ID", style="bold")
@@ -54,8 +55,13 @@ def _render_agent_hits_table(question: str, hits: Sequence[SearchHit], title_pre
     tbl.add_column("Explores (`model.explore`)", style="yellow")
     tbl.add_column("Deep Link (`agent_url`)", style="blue")
 
+    warnings_to_print: list[tuple[str, str, str]] = []
     for hit in hits:
         explores_str = ", ".join(hit.explores) if hit.explores else "N/A"
+        if hit.has_inaccessible_source or hit.warning:
+            warn_text = hit.warning or INACCESSIBLE_SOURCE_WARNING
+            explores_str = f"{explores_str}\n[bold yellow]⚠ Warning:[/bold yellow] {warn_text}"
+            warnings_to_print.append((hit.name, hit.agent_id, warn_text))
         tbl.add_row(
             str(hit.rank),
             f"{hit.similarity_score:.4f}",
@@ -66,6 +72,8 @@ def _render_agent_hits_table(question: str, hits: Sequence[SearchHit], title_pre
         )
 
     out_console.print(tbl)
+    for name, agent_id, warn_text in warnings_to_print:
+        out_console.print(f"[bold yellow]⚠ Warning ({name} / {agent_id}):[/bold yellow] {warn_text}")
 
 
 def _render_golden_query_hits_table(
@@ -86,12 +94,17 @@ def _render_golden_query_hits_table(
     tbl.add_column("Explore (`model.explore`)", style="yellow")
     tbl.add_column("Agent (`agent_name` & `agent_id`)", style="magenta")
 
+    warnings_to_print: list[tuple[str, str, str]] = []
     for gq in hits:
         explore_str = (
             f"{gq.model}.{gq.explore}"
             if (gq.model and gq.explore)
             else (gq.model or gq.explore or "N/A")
         )
+        if gq.has_inaccessible_source or gq.warning:
+            warn_text = gq.warning or INACCESSIBLE_SOURCE_WARNING
+            explore_str = f"{explore_str}\n[bold yellow]⚠ Warning:[/bold yellow] {warn_text}"
+            warnings_to_print.append((gq.agent_name, gq.agent_id, warn_text))
         questions_str = "; ".join(gq.questions) if gq.questions else "N/A"
         tbl.add_row(
             str(gq.rank),
@@ -103,6 +116,10 @@ def _render_golden_query_hits_table(
         )
 
     out_console.print(tbl)
+    for agent_name, agent_id, warn_text in warnings_to_print:
+        out_console.print(
+            f"[bold yellow]⚠ Warning ({agent_name} / {agent_id}):[/bold yellow] {warn_text}"
+        )
 
 
 @app.command("init")
@@ -489,6 +506,18 @@ def search_cmd(
             "if >= 1 Golden Queries meet confidence_score."
         ),
     ),
+    user_id: Optional[str] = typer.Option(
+        None,
+        "--user-id",
+        "-u",
+        help="Looker user ID to sudo as (via Admin credentials) so only agents accessible to that user are searched.",
+    ),
+    access_token: Optional[str] = typer.Option(
+        None,
+        "--access-token",
+        envvar="LOOKER_ACCESS_TOKEN",
+        help="Looker user access token (OAuth or session token) to fetch only agents accessible to that user.",
+    ),
     project_id: Optional[str] = typer.Option(
         None, "--project-id", "--project", help="Google Cloud project ID."
     ),
@@ -527,6 +556,18 @@ def search_cmd(
             err_console.print(f"[bold red]{msg}[/bold red]")
         raise typer.Exit(code=2)
 
+    cleaned_user_id = user_id.strip() if user_id and user_id.strip() else None
+    cleaned_access_token = (
+        access_token.strip() if access_token and access_token.strip() else None
+    )
+    if cleaned_user_id is not None and cleaned_access_token is not None:
+        msg = "Error: Specify either --user-id / -u or --access-token, not both."
+        if json_output:
+            _emit_json({"status": "error", "error": msg})
+        else:
+            err_console.print(f"[bold red]{msg}[/bold red]")
+        raise typer.Exit(code=2)
+
     cfg = SyncConfig.from_env(
         env_file=env_file,
         project_id=project_id,
@@ -537,6 +578,22 @@ def search_cmd(
         connection_id=connection_id,
         endpoint=endpoint,
     )
+
+    user_access: Optional[UserAgentAccess] = None
+    if cleaned_user_id is not None or cleaned_access_token is not None:
+        extractor = LookerAgentExtractor(config=cfg)
+        try:
+            user_access = extractor.fetch_user_accessible_agents(
+                user_id=cleaned_user_id,
+                access_token=cleaned_access_token,
+            )
+        except Exception as exc:
+            if json_output:
+                _emit_json({"status": "error", "error": str(exc)})
+            else:
+                err_console.print(f"[bold red]User access check failed:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+
     bq_sync = BigQueryAgentSync(config=cfg)
 
     if golden_queries is not None:
@@ -548,6 +605,12 @@ def search_cmd(
                 golden_queries_top_k=golden_queries,
                 confidence_score=effective_confidence,
                 stop_on_golden_match=stop_on_golden_match,
+                allowed_agent_ids=user_access.allowed_agent_ids if user_access else None,
+                inaccessible_source_agent_ids=(
+                    user_access.inaccessible_source_agent_ids if user_access else None
+                ),
+                authz_mode=user_access.mode if user_access else "admin",
+                user_id=user_access.user_id if user_access else None,
             )
         except Exception as exc:
             if json_output:
@@ -562,6 +625,12 @@ def search_cmd(
                     "status": "ok",
                     **two_step_res.model_dump(),
                 }
+            )
+            return
+
+        if user_access is not None and len(user_access.allowed_agent_ids) == 0:
+            out_console.print(
+                "[yellow]User has access to 0 CA agents in Looker; skipping BigQuery search.[/yellow]"
             )
             return
 
@@ -597,7 +666,14 @@ def search_cmd(
         return
 
     try:
-        hits = bq_sync.search_agents(question=question, top_k=top_k)
+        hits = bq_sync.search_agents(
+            question=question,
+            top_k=top_k,
+            allowed_agent_ids=user_access.allowed_agent_ids if user_access else None,
+            inaccessible_source_agent_ids=(
+                user_access.inaccessible_source_agent_ids if user_access else None
+            ),
+        )
     except Exception as exc:
         if json_output:
             _emit_json({"status": "error", "error": str(exc)})
@@ -611,8 +687,17 @@ def search_cmd(
                 "status": "ok",
                 "question": question,
                 "top_k": top_k,
+                "authz_mode": user_access.mode if user_access else "admin",
+                "user_id": user_access.user_id if user_access else None,
+                "allowed_agent_count": len(user_access.allowed_agent_ids) if user_access else None,
                 "results": [h.model_dump() for h in hits],
             }
+        )
+        return
+
+    if user_access is not None and len(user_access.allowed_agent_ids) == 0:
+        out_console.print(
+            "[yellow]User has access to 0 CA agents in Looker; skipping BigQuery search.[/yellow]"
         )
         return
 

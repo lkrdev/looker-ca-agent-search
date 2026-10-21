@@ -31,6 +31,45 @@ logger = logging.getLogger(__name__)
 
 GCP_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
+INACCESSIBLE_SOURCE_WARNING = (
+    "User lacks access to one or more LookML sources on this agent; some queries may fail."
+)
+
+
+def _clean_id_list(ids: Sequence[str]) -> list[str]:
+    """Deduplicate and strip agent IDs while preserving first-seen order."""
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for raw in ids:
+        if raw is None:
+            continue
+        val = str(raw).strip()
+        if val and val not in seen:
+            seen.add(val)
+            cleaned.append(val)
+    return cleaned
+
+
+def _resolve_scope_ids(
+    candidate_agent_ids: Optional[Sequence[str]],
+    allowed_agent_ids: Optional[Sequence[str]],
+) -> Optional[list[str]]:
+    """Resolve effective `agent_id` scope from Stage 1 candidates and user ACLs."""
+    if candidate_agent_ids is None and allowed_agent_ids is None:
+        return None
+    cleaned_candidates = (
+        _clean_id_list(candidate_agent_ids) if candidate_agent_ids is not None else None
+    )
+    cleaned_allowed = (
+        _clean_id_list(allowed_agent_ids) if allowed_agent_ids is not None else None
+    )
+    if cleaned_candidates is not None and cleaned_allowed is not None:
+        allowed_set = set(cleaned_allowed)
+        return [aid for aid in cleaned_candidates if aid in allowed_set]
+    if cleaned_candidates is not None:
+        return cleaned_candidates
+    return cleaned_allowed
+
 
 def build_table_ddl(
     project_id: str,
@@ -913,12 +952,19 @@ ORDER BY {id_col}"""
         self,
         question: str,
         top_k: int = 5,
+        allowed_agent_ids: Optional[Sequence[str]] = None,
+        inaccessible_source_agent_ids: Optional[Sequence[str]] = None,
     ) -> list[GoldenQuerySearchHit]:
         """Stage 1: Search `ca_golden_queries` using `AI.SEARCH` with automatic `AI.EMBED` + `ML.DISTANCE` fallback."""
         cleaned_q = question.strip()
         if not cleaned_q:
             raise ValueError("Search question must not be empty.")
         k = max(1, int(top_k))
+
+        scope_ids = _resolve_scope_ids(None, allowed_agent_ids)
+        if scope_ids is not None and not scope_ids:
+            return []
+        inaccessible_set = set(_clean_id_list(inaccessible_source_agent_ids or ()))
 
         check_sql = f"""SELECT
   COUNT(*) AS total_rows,
@@ -936,7 +982,23 @@ FROM `{self.config.full_golden_queries_table_id}`"""
         conn_id = self.config.full_connection_id
         endpoint = self.config.endpoint
 
+        query_parameters: list[Any] = [
+            bigquery.ScalarQueryParameter("query_text", "STRING", cleaned_q),
+            bigquery.ScalarQueryParameter("top_k", "INT64", k),
+        ]
+
         if populated_count >= total_rows and total_rows > 0:
+            if scope_ids is not None:
+                query_parameters.append(
+                    bigquery.ArrayQueryParameter("allowed_agent_ids", "STRING", scope_ids)
+                )
+                gq_source_expr = (
+                    f"(SELECT * FROM `{self.config.full_golden_queries_table_id}` "
+                    "WHERE agent_id IN UNNEST(@allowed_agent_ids))"
+                )
+            else:
+                gq_source_expr = f"TABLE `{self.config.full_golden_queries_table_id}`"
+
             search_sql = f"""SELECT
   base.record_id,
   base.golden_query_id,
@@ -956,7 +1018,7 @@ FROM `{self.config.full_golden_queries_table_id}`"""
   (POW(distance, 2) / 2.0) AS distance,
   (1.0 - POW(distance, 2) / 2.0) AS cosine_similarity
 FROM AI.SEARCH(
-  TABLE `{self.config.full_golden_queries_table_id}`,
+  {gq_source_expr},
   'metadata_concat',
   @query_text,
   top_k => @top_k
@@ -964,6 +1026,12 @@ FROM AI.SEARCH(
 ORDER BY distance ASC
 LIMIT @top_k"""
         else:
+            where_filter = ""
+            if scope_ids is not None:
+                where_filter = "\n  WHERE t.agent_id IN UNNEST(@allowed_agent_ids)"
+                query_parameters.append(
+                    bigquery.ArrayQueryParameter("allowed_agent_ids", "STRING", scope_ids)
+                )
             search_sql = f"""WITH query_emb AS (
   SELECT AI.EMBED(
     @query_text,
@@ -999,7 +1067,7 @@ candidate_gqs AS (
         endpoint => '{endpoint}'
       ).result
     END AS gq_vec
-  FROM `{self.config.full_golden_queries_table_id}` AS t
+  FROM `{self.config.full_golden_queries_table_id}` AS t{where_filter}
 )
 SELECT
   c.record_id,
@@ -1025,12 +1093,7 @@ WHERE ARRAY_LENGTH(c.gq_vec) > 0
 ORDER BY distance ASC
 LIMIT @top_k"""
 
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("query_text", "STRING", cleaned_q),
-                bigquery.ScalarQueryParameter("top_k", "INT64", k),
-            ]
-        )
+        job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
         rows = list(self.client.query(search_sql, job_config=job_config).result())
         hits: list[GoldenQuerySearchHit] = []
         for idx, row in enumerate(rows, start=1):
@@ -1051,12 +1114,14 @@ LIMIT @top_k"""
             questions_val = getattr(row, "questions", None) or []
             fields_val = getattr(row, "fields", None) or []
             sorts_val = getattr(row, "sorts", None) or []
+            agent_id_str = str(getattr(row, "agent_id", ""))
+            has_inaccessible = agent_id_str in inaccessible_set
             hits.append(
                 GoldenQuerySearchHit(
                     rank=idx,
                     record_id=str(getattr(row, "record_id", "")),
                     golden_query_id=str(getattr(row, "golden_query_id", "")),
-                    agent_id=str(getattr(row, "agent_id", "")),
+                    agent_id=agent_id_str,
                     agent_name=str(getattr(row, "agent_name", "")),
                     agent_url=str(getattr(row, "agent_url", "")),
                     instance_url=getattr(row, "instance_url", None),
@@ -1071,6 +1136,8 @@ LIMIT @top_k"""
                     similarity_score=round(sim, 6),
                     distance=round(dist, 6),
                     embedding_source=str(getattr(row, "embedding_source", "STORED")),
+                    has_inaccessible_source=has_inaccessible,
+                    warning=INACCESSIBLE_SOURCE_WARNING if has_inaccessible else None,
                 )
             )
         return hits
@@ -1080,10 +1147,12 @@ LIMIT @top_k"""
         question: str,
         top_k: int = 5,
         candidate_agent_ids: Optional[Sequence[str]] = None,
+        allowed_agent_ids: Optional[Sequence[str]] = None,
+        inaccessible_source_agent_ids: Optional[Sequence[str]] = None,
     ) -> list[SearchHit]:
         """Route a natural language question to top-K CA agents using semantic vector search.
 
-        When `candidate_agent_ids` is provided (from Stage 1 Golden Query matches),
+        When `candidate_agent_ids` and/or `allowed_agent_ids` are provided,
         filters `ca_agents` strictly to `WHERE agent_id IN UNNEST(@matched_agent_ids)`.
         Uses `AI.SEARCH` when all rows have populated autonomous embeddings, and
         transparently falls back to `AI.EMBED` + `ML.DISTANCE(..., 'COSINE')` when
@@ -1094,11 +1163,10 @@ LIMIT @top_k"""
             raise ValueError("Search question must not be empty.")
         k = max(1, int(top_k))
 
-        matched_ids: Optional[list[str]] = None
-        if candidate_agent_ids is not None:
-            matched_ids = [str(aid).strip() for aid in candidate_agent_ids if str(aid).strip()]
-            if not matched_ids:
-                return []
+        matched_ids = _resolve_scope_ids(candidate_agent_ids, allowed_agent_ids)
+        if matched_ids is not None and not matched_ids:
+            return []
+        inaccessible_set = set(_clean_id_list(inaccessible_source_agent_ids or ()))
 
         # Check whether all rows have populated stored embeddings
         check_sql = f"""SELECT
@@ -1124,38 +1192,17 @@ FROM `{self.config.full_table_id}`"""
 
         if populated_count >= total_rows and total_rows > 0:
             if matched_ids is not None:
-                ai_search_top_k = max(k, total_rows, 1000)
-                query_params.append(
-                    bigquery.ScalarQueryParameter("ai_search_top_k", "INT64", ai_search_top_k)
-                )
                 query_params.append(
                     bigquery.ArrayQueryParameter("matched_agent_ids", "STRING", matched_ids)
                 )
-                search_sql = f"""SELECT
-  base.agent_id,
-  base.name,
-  base.description,
-  base.category,
-  base.agent_url,
-  base.instance_url,
-  TO_JSON_STRING(base.sources) AS sources_json,
-  'STORED' AS embedding_source,
-  (POW(distance, 2) / 2.0) AS distance,
-  (1.0 - POW(distance, 2) / 2.0) AS cosine_similarity
-FROM (
-  SELECT base, distance, base.agent_id AS agent_id
-  FROM AI.SEARCH(
-    TABLE `{self.config.full_table_id}`,
-    'metadata_concat',
-    @query_text,
-    top_k => @ai_search_top_k
-  )
-)
-WHERE agent_id IN UNNEST(@matched_agent_ids)
-ORDER BY distance ASC
-LIMIT @top_k"""
+                agent_source_expr = (
+                    f"(SELECT * FROM `{self.config.full_table_id}` "
+                    "WHERE agent_id IN UNNEST(@matched_agent_ids))"
+                )
             else:
-                search_sql = f"""SELECT
+                agent_source_expr = f"TABLE `{self.config.full_table_id}`"
+
+            search_sql = f"""SELECT
   base.agent_id,
   base.name,
   base.description,
@@ -1167,7 +1214,7 @@ LIMIT @top_k"""
   (POW(distance, 2) / 2.0) AS distance,
   (1.0 - POW(distance, 2) / 2.0) AS cosine_similarity
 FROM AI.SEARCH(
-  TABLE `{self.config.full_table_id}`,
+  {agent_source_expr},
   'metadata_concat',
   @query_text,
   top_k => @top_k
@@ -1255,10 +1302,12 @@ LIMIT @top_k"""
 
             dist = float(getattr(row, "distance", 0.0) or 0.0)
             sim = float(getattr(row, "cosine_similarity", 1.0 - dist) or (1.0 - dist))
+            agent_id_str = str(getattr(row, "agent_id", ""))
+            has_inaccessible = agent_id_str in inaccessible_set
             hits.append(
                 SearchHit(
                     rank=idx,
-                    agent_id=str(getattr(row, "agent_id", "")),
+                    agent_id=agent_id_str,
                     name=str(getattr(row, "name", "")),
                     description=getattr(row, "description", None),
                     category=getattr(row, "category", None),
@@ -1269,6 +1318,8 @@ LIMIT @top_k"""
                     explores=explores_list,
                     sources=parsed_sources,
                     embedding_source=str(getattr(row, "embedding_source", "STORED")),
+                    has_inaccessible_source=has_inaccessible,
+                    warning=INACCESSIBLE_SOURCE_WARNING if has_inaccessible else None,
                 )
             )
         return hits
@@ -1280,6 +1331,10 @@ LIMIT @top_k"""
         golden_queries_top_k: int = 5,
         confidence_score: float = 0.60,
         stop_on_golden_match: bool = False,
+        allowed_agent_ids: Optional[Sequence[str]] = None,
+        inaccessible_source_agent_ids: Optional[Sequence[str]] = None,
+        authz_mode: str = "admin",
+        user_id: Optional[str] = None,
     ) -> TwoStepSearchResult:
         """Execute Two-Step Semantic Routing Search across `ca_golden_queries` and `ca_agents`.
 
@@ -1292,46 +1347,57 @@ LIMIT @top_k"""
             the distinct `agent_id`s from those matched Golden Queries (`WHERE agent_id IN UNNEST(@matched_agent_ids)`).
         - If 0 Golden Queries meet `confidence_score`:
           - Return no Golden Queries (`golden_query_results=[]`) and proceed to an
-            unfiltered Stage 2 Agent search across all rows in `ca_agents`.
+            unfiltered Stage 2 Agent search across all rows in `ca_agents` (or within `allowed_agent_ids` when user-scoped).
         """
         if not (0.0 <= confidence_score <= 1.0):
             raise ValueError("confidence_score must be between 0.0 and 1.0 inclusive.")
         gq_k = max(1, int(golden_queries_top_k))
 
-        stage1_candidates = self.search_golden_queries(question=question, top_k=gq_k)
+        cleaned_allowed = _resolve_scope_ids(None, allowed_agent_ids)
+        allowed_count = len(cleaned_allowed) if cleaned_allowed is not None else None
+        base_kwargs: dict[str, Any] = {
+            "question": question,
+            "top_k": top_k,
+            "golden_queries_requested": gq_k,
+            "confidence_score": confidence_score,
+            "stop_on_golden_match": stop_on_golden_match,
+            "authz_mode": authz_mode,
+            "user_id": user_id,
+            "allowed_agent_count": allowed_count,
+        }
+        if cleaned_allowed is not None and not cleaned_allowed:
+            return TwoStepSearchResult(**base_kwargs)
+
+        stage1_candidates = self.search_golden_queries(
+            question=question,
+            top_k=gq_k,
+            allowed_agent_ids=cleaned_allowed,
+            inaccessible_source_agent_ids=inaccessible_source_agent_ids,
+        )
         matched_gqs: list[GoldenQuerySearchHit] = []
         matched_agent_ids: list[str] = []
+        seen_matched_agents: set[str] = set()
         for hit in stage1_candidates:
             if hit.similarity_score >= confidence_score:
                 matched_gqs.append(hit.model_copy(update={"rank": len(matched_gqs) + 1}))
-                if hit.agent_id and hit.agent_id not in matched_agent_ids:
+                if hit.agent_id and hit.agent_id not in seen_matched_agents:
+                    seen_matched_agents.add(hit.agent_id)
                     matched_agent_ids.append(hit.agent_id)
 
         if matched_gqs:
-            if stop_on_golden_match:
-                return TwoStepSearchResult(
+            agent_hits = (
+                []
+                if stop_on_golden_match
+                else self.search_agents(
                     question=question,
                     top_k=top_k,
-                    golden_queries_requested=gq_k,
-                    confidence_score=confidence_score,
-                    stop_on_golden_match=True,
-                    golden_query_matched=True,
-                    stage2_filtered=True,
-                    matched_agent_ids=matched_agent_ids,
-                    golden_query_results=matched_gqs,
-                    results=[],
+                    candidate_agent_ids=matched_agent_ids,
+                    allowed_agent_ids=cleaned_allowed,
+                    inaccessible_source_agent_ids=inaccessible_source_agent_ids,
                 )
-            agent_hits = self.search_agents(
-                question=question,
-                top_k=top_k,
-                candidate_agent_ids=matched_agent_ids,
             )
             return TwoStepSearchResult(
-                question=question,
-                top_k=top_k,
-                golden_queries_requested=gq_k,
-                confidence_score=confidence_score,
-                stop_on_golden_match=False,
+                **base_kwargs,
                 golden_query_matched=True,
                 stage2_filtered=True,
                 matched_agent_ids=matched_agent_ids,
@@ -1343,17 +1409,11 @@ LIMIT @top_k"""
             question=question,
             top_k=top_k,
             candidate_agent_ids=None,
+            allowed_agent_ids=cleaned_allowed,
+            inaccessible_source_agent_ids=inaccessible_source_agent_ids,
         )
         return TwoStepSearchResult(
-            question=question,
-            top_k=top_k,
-            golden_queries_requested=gq_k,
-            confidence_score=confidence_score,
-            stop_on_golden_match=stop_on_golden_match,
-            golden_query_matched=False,
-            stage2_filtered=False,
-            matched_agent_ids=[],
-            golden_query_results=[],
+            **base_kwargs,
             results=agent_hits,
         )
 

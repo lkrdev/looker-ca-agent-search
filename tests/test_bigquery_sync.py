@@ -476,3 +476,148 @@ def test_search_two_step_with_match_stop_on_match_and_unfiltered_fallback(
     assert len(unfiltered_agent_queries) == 1
     assert "WHERE agent_id IN UNNEST(@matched_agent_ids)" not in unfiltered_agent_queries[0]
 
+
+def test_user_scoped_search_pre_filtering_short_circuit_and_warnings(
+    sample_sync_config: SyncConfig,
+) -> None:
+    """Verify `allowed_agent_ids` pre-filtering, empty short-circuit, and `inaccessible_source_agent_ids` warnings."""
+    fake_bq = FakeBigQueryClient()
+    sync = BigQueryAgentSync(
+        config=sample_sync_config,
+        client=fake_bq,  # type: ignore[arg-type]
+        credentials=object(),
+        session=FakeAuthorizedSession(),
+    )
+
+    # 1. Empty allowed_agent_ids=[] short-circuits with 0 BigQuery queries executed
+    fake_bq.queries.clear()
+    assert sync.search_golden_queries("Question?", top_k=5, allowed_agent_ids=[]) == []
+    assert sync.search_agents("Question?", top_k=5, allowed_agent_ids=[]) == []
+    empty_ts = sync.search_two_step(
+        "Question?",
+        top_k=5,
+        golden_queries_top_k=5,
+        allowed_agent_ids=[],
+        authz_mode="user_id",
+        user_id="42",
+    )
+    assert empty_ts.allowed_agent_count == 0
+    assert empty_ts.authz_mode == "user_id"
+    assert empty_ts.user_id == "42"
+    assert empty_ts.golden_query_results == []
+    assert empty_ts.results == []
+    assert fake_bq.queries == []
+
+    # 2. Pre-filtering search_golden_queries and search_agents on AI.SEARCH path + inaccessible_source_agent_ids warning
+    fake_bq.gq_status_count_rows = [
+        FakeRow({"total_rows": 84, "populated_count": 84, "pending_count": 0, "error_count": 0})
+    ]
+    fake_bq.status_count_rows = [
+        FakeRow({"total_rows": 22, "populated_count": 22, "pending_count": 0, "error_count": 0})
+    ]
+    fake_bq.queries.clear()
+    gq_hits_ai = sync.search_golden_queries(
+        "Strategic projects?",
+        top_k=3,
+        allowed_agent_ids=["agent-eng-001", "agent-fin-002"],
+        inaccessible_source_agent_ids=["agent-eng-001"],
+    )
+    assert len(gq_hits_ai) == 1
+    assert gq_hits_ai[0].has_inaccessible_source is True
+    assert gq_hits_ai[0].warning is not None
+    assert "lacks access to one or more LookML sources" in gq_hits_ai[0].warning
+    gq_ai_sql = [q[0] for q in fake_bq.queries if "AI.SEARCH" in q[0]][0]
+    assert "WHERE agent_id IN UNNEST(@allowed_agent_ids)" in gq_ai_sql
+
+    fake_bq.queries.clear()
+    agent_hits_ai = sync.search_agents(
+        "Sprint velocity?",
+        top_k=3,
+        allowed_agent_ids=["agent-eng-001"],
+        inaccessible_source_agent_ids=["agent-eng-001"],
+    )
+    assert len(agent_hits_ai) == 1
+    assert agent_hits_ai[0].has_inaccessible_source is True
+    assert agent_hits_ai[0].warning is not None
+    agent_ai_sql = [q[0] for q in fake_bq.queries if "AI.SEARCH" in q[0]][0]
+    assert "WHERE agent_id IN UNNEST(@matched_agent_ids)" in agent_ai_sql
+
+    # 3. Pre-filtering search_golden_queries and search_agents on ML.DISTANCE fallback path
+    fake_bq.gq_status_count_rows = [
+        FakeRow({"total_rows": 84, "populated_count": 80, "pending_count": 4, "error_count": 0})
+    ]
+    fake_bq.status_count_rows = [
+        FakeRow({"total_rows": 22, "populated_count": 20, "pending_count": 2, "error_count": 0})
+    ]
+    fake_bq.queries.clear()
+    gq_hits_fb = sync.search_golden_queries(
+        "Strategic projects?",
+        top_k=3,
+        allowed_agent_ids=["agent-eng-001"],
+        inaccessible_source_agent_ids=[],
+    )
+    assert len(gq_hits_fb) == 1
+    assert gq_hits_fb[0].has_inaccessible_source is False
+    assert gq_hits_fb[0].warning is None
+    gq_fb_sql = [q[0] for q in fake_bq.queries if "ML.DISTANCE" in q[0]][0]
+    assert "WHERE t.agent_id IN UNNEST(@allowed_agent_ids)" in gq_fb_sql
+
+    fake_bq.queries.clear()
+    agent_hits_fb = sync.search_agents(
+        "Sprint velocity?",
+        top_k=3,
+        allowed_agent_ids=["agent-eng-001"],
+        inaccessible_source_agent_ids=[],
+    )
+    assert len(agent_hits_fb) == 1
+    assert agent_hits_fb[0].has_inaccessible_source is False
+    assert agent_hits_fb[0].warning is None
+    agent_fb_sql = [q[0] for q in fake_bq.queries if "ML.DISTANCE" in q[0]][0]
+    assert "WHERE agent_id IN UNNEST(@matched_agent_ids)" in agent_fb_sql
+
+    # 4. search_two_step intersects Stage 1 matched agents with allowed_agent_ids,
+    #    and when Stage 1 has 0 matches, Stage 2 still filters by allowed_agent_ids (never unscoped!)
+    fake_bq.queries.clear()
+    ts_matched = sync.search_two_step(
+        question="What is the status and completion progress of all strategic projects?",
+        top_k=3,
+        golden_queries_top_k=5,
+        confidence_score=0.65,
+        stop_on_golden_match=False,
+        allowed_agent_ids=["agent-eng-001", "agent-ops-002"],
+        inaccessible_source_agent_ids=["agent-eng-001"],
+        authz_mode="user_id",
+        user_id="42",
+    )
+    assert ts_matched.authz_mode == "user_id"
+    assert ts_matched.user_id == "42"
+    assert ts_matched.allowed_agent_count == 2
+    assert ts_matched.golden_query_matched is True
+    assert ts_matched.matched_agent_ids == ["agent-eng-001"]
+    assert ts_matched.golden_query_results[0].has_inaccessible_source is True
+    assert ts_matched.results[0].has_inaccessible_source is True
+
+    # Stage 1 has 0 matches (confidence_score=0.99) -> Stage 2 MUST still filter by allowed_agent_ids!
+    fake_bq.queries.clear()
+    ts_stage1_miss = sync.search_two_step(
+        question="Unmatched question?",
+        top_k=3,
+        golden_queries_top_k=5,
+        confidence_score=0.99,
+        stop_on_golden_match=False,
+        allowed_agent_ids=["agent-eng-001"],
+        inaccessible_source_agent_ids=["agent-eng-001"],
+        authz_mode="access_token",
+    )
+    assert ts_stage1_miss.authz_mode == "access_token"
+    assert ts_stage1_miss.allowed_agent_count == 1
+    assert ts_stage1_miss.golden_query_matched is False
+    stage2_queries = [
+        (sql, cfg)
+        for sql, cfg in fake_bq.queries
+        if "ca_agents" in sql and "COUNT(*)" not in sql
+    ]
+    assert len(stage2_queries) == 1
+    assert "WHERE agent_id IN UNNEST(@matched_agent_ids)" in stage2_queries[0][0]
+
+

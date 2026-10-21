@@ -8,6 +8,7 @@ import logging
 from typing import Any, Optional, Protocol
 
 import looker_sdk
+import requests
 from looker_sdk import error as looker_error
 
 from ca_agent_sync.config import SyncConfig
@@ -15,6 +16,7 @@ from ca_agent_sync.models import (
     AgentMetadataRecord,
     ExploreHeader,
     GoldenQueryRecord,
+    UserAgentAccess,
     build_golden_query_metadata_concat,
     build_metadata_concat,
 )
@@ -412,3 +414,104 @@ class LookerAgentExtractor:
             include_explore_headers=include_explore_headers,
         )
         return record, False
+
+    def fetch_user_accessible_agents(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        access_token: Optional[str] = None,
+    ) -> UserAgentAccess:
+        """Resolve the CA agents accessible to a specific Looker user via sudo (`user_id`) or OAuth (`access_token`)."""
+        cleaned_uid = _clean_optional_str(user_id)
+        cleaned_token = _clean_optional_str(access_token)
+
+        if (cleaned_uid is None) == (cleaned_token is None):
+            raise ValueError(
+                "Exactly one of `user_id` or `access_token` must be provided to fetch_user_accessible_agents."
+            )
+
+        fields_spec = "id,deleted,has_inaccessible_source"
+        if cleaned_token is not None:
+            if not self.config.normalized_instance_url:
+                raise ValueError(
+                    "Missing required Looker base URL: LOOKERSDK_BASE_URL must be configured when using `access_token`."
+                )
+            auth_header = {"Authorization": f"Bearer {cleaned_token}"}
+            if self._sdk is not None:
+                raw_agents = (
+                    self._sdk.search_agents(
+                        deleted=False,
+                        fields=fields_spec,
+                        transport_options={"headers": auth_header},
+                    )
+                    or []
+                )
+            else:
+                verify_ssl = str(self.config.looker_verify_ssl or "true").strip().lower() not in (
+                    "false",
+                    "0",
+                    "no",
+                )
+                try:
+                    timeout = int(str(self.config.looker_timeout or "120").strip())
+                except ValueError:
+                    timeout = 120
+
+                url = f"{self.config.normalized_instance_url}/api/4.0/agents/search"
+                response = requests.get(
+                    url,
+                    params={"deleted": "false", "fields": fields_spec},
+                    headers=auth_header,
+                    verify=verify_ssl,
+                    timeout=timeout,
+                )
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Looker /api/4.0/agents/search failed with HTTP {response.status_code}: {response.text}"
+                    )
+                parsed_json = response.json()
+                raw_agents = parsed_json if isinstance(parsed_json, list) else []
+        else:
+            assert cleaned_uid is not None
+            sdk = self.sdk
+            auth_obj = getattr(sdk, "auth", None)
+            sudo_target: Any = int(cleaned_uid) if cleaned_uid.isdigit() else cleaned_uid
+            logout_fn = None
+            try:
+                if auth_obj is not None and hasattr(auth_obj, "login_user"):
+                    auth_obj.login_user(sudo_target)
+                    logout_fn = getattr(auth_obj, "logout", None)
+                elif hasattr(sdk, "login_user_sudo"):
+                    sdk.login_user_sudo(sudo_target)
+                    logout_fn = getattr(sdk, "logout", None)
+                raw_agents = sdk.search_agents(deleted=False, fields=fields_spec) or []
+            finally:
+                if callable(logout_fn):
+                    logout_fn()
+
+        allowed_agent_ids: list[str] = []
+        inaccessible_source_agent_ids: list[str] = []
+        seen_ids: set[str] = set()
+        seen_inaccessible_ids: set[str] = set()
+
+        for item in raw_agents or []:
+            getter = item.get if isinstance(item, dict) else lambda k, d=False: getattr(item, k, d)
+            if getter("deleted", False) is True:
+                continue
+            agent_id = str(getter("id", "") or "").strip()
+            if not agent_id:
+                continue
+            if agent_id not in seen_ids:
+                seen_ids.add(agent_id)
+                allowed_agent_ids.append(agent_id)
+            if getter("has_inaccessible_source", False) is True and agent_id not in seen_inaccessible_ids:
+                seen_inaccessible_ids.add(agent_id)
+                inaccessible_source_agent_ids.append(agent_id)
+
+        return UserAgentAccess(
+            mode="access_token" if cleaned_token is not None else "user_id",
+            user_id=cleaned_uid,
+            allowed_agent_ids=allowed_agent_ids,
+            inaccessible_source_agent_ids=inaccessible_source_agent_ids,
+        )
+
