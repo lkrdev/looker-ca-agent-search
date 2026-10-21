@@ -2,7 +2,7 @@
 
 Complete reference for the `ca-agent-sync` Python CLI service, which synchronizes Looker Conversational Analytics (CA) agents and their Golden Queries into two Google Cloud BigQuery Autonomous Embedding tables (`ca_agents` and `ca_golden_queries`) and performs single-step or two-step candidate-filtered semantic vector routing—with optional multi-tenant / user-scoped authorization (`--user-id` or `--access-token`).
 
-For architecture diagrams, IAM setup, BigQuery table schemas/DDLs, SQL query examples, and [**Multi-Tenant & User-Scoped Search Architecture (Important Callouts)**](README.md#2-multi-tenant--user-scoped-search-architecture-important-callouts), see [**`README.md`**](README.md).
+For a high-level overview, quickstart, and multi-tenant usage guide, see [**`README.md`**](README.md). For internal package architecture and module contracts, see [**`PROJECT.md`**](PROJECT.md).
 
 ---
 
@@ -20,7 +20,13 @@ For architecture diagrams, IAM setup, BigQuery table schemas/DDLs, SQL query exa
    - [7.3 Two-Step Search with Stage 1 Early Exit (`--stop-on-golden-match`)](#73-two-step-search-with-stage-1-early-exit---stop-on-golden-match)
    - [7.4 Two-Step Search with Stage 1 Miss (Unfiltered Stage 2 Fallback)](#74-two-step-search-with-stage-1-miss-unfiltered-stage-2-fallback)
    - [7.5 Multi-Tenant / User-Scoped Search (`--user-id` & `--access-token`) & Partial Source Access Warnings](#75-multi-tenant--user-scoped-search---user-id----access-token--partial-source-access-warnings)
-8. [Exit Codes & Error Handling](#8-exit-codes--error-handling)
+8. [BigQuery Dual-Table Schemas & Direct SQL Recipes](#8-bigquery-dual-table-schemas--direct-sql-recipes)
+   - [8.1 Table Schemas (`ca_agents` & `ca_golden_queries`)](#81-table-schemas-ca_agents--ca_golden_queries)
+   - [8.2 Stage 1 SQL: Search Curated Golden Queries (`ca_golden_queries`)](#82-stage-1-sql-search-curated-golden-queries-ca_golden_queries)
+   - [8.3 Stage 2 SQL: Candidate-Filtered & User-Scoped Agent Search (`ca_agents`)](#83-stage-2-sql-candidate-filtered--user-scoped-agent-search-ca_agents)
+   - [8.4 Single-Step / Unfiltered Fallback SQL (`ca_agents`)](#84-single-step--unfiltered-fallback-sql-ca_agents)
+9. [Google Cloud APIs, IAM Roles & Troubleshooting](#9-google-cloud-apis-iam-roles--troubleshooting)
+10. [Exit Codes & Error Handling](#10-exit-codes--error-handling)
 
 ---
 
@@ -739,8 +745,6 @@ uv run ca-agent-sync search "What is our sprint velocity and SLA compliance rate
 
 ### 7.5 Multi-Tenant / User-Scoped Search (`--user-id` & `--access-token`) & Partial Source Access Warnings
 
-> **Full Architectural Details**: See [**Multi-Tenant & User-Scoped Search Architecture (Important Callouts)**](README.md#2-multi-tenant--user-scoped-search-architecture-important-callouts) in `README.md` for complete architectural guidance.
-
 To ensure search only returns CA agents that a specific target Looker user is authorized to access—while maintaining a single global set of embeddings in BigQuery—pass either `--user-id` (`-u`) or `--access-token` (`LOOKER_ACCESS_TOKEN`):
 
 1. **`--user-id`, `-u <LOOKER_USER_ID>` (Admin Sudo Impersonation)**:
@@ -872,7 +876,311 @@ LOOKER_ACCESS_TOKEN="eyJhbGciOi..." uv run ca-agent-sync search \
 
 ---
 
-## 8. Exit Codes & Error Handling
+## 8. BigQuery Dual-Table Schemas & Direct SQL Recipes
+
+### 8.1 Table Schemas (`ca_agents` & `ca_golden_queries`)
+
+#### Table 1: `ca_agents` (`<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_agents`)
+
+Stores one row per active Looker CA agent, keyed on `agent_id`:
+
+```sql
+CREATE TABLE IF NOT EXISTS `<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_agents` (
+  agent_id STRING NOT NULL,
+  instance_url STRING,
+  agent_url STRING,
+  name STRING,
+  description STRING,
+  category STRING,
+  system_instructions STRING,
+  sources JSON,
+  golden_queries JSON,
+  code_interpreter BOOL,
+  created_by_name STRING,
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP,
+  synced_at TIMESTAMP,
+  metadata_concat STRING,
+  embedding STRUCT<result ARRAY<FLOAT64>, status STRING>
+    GENERATED ALWAYS AS (
+      AI.EMBED(
+        metadata_concat,
+        connection_id => '<YOUR_GCP_PROJECT_ID>.us.ca_agent_embedding_conn',
+        endpoint => 'text-embedding-005'
+      )
+    )
+    STORED OPTIONS (asynchronous = TRUE)
+);
+```
+
+##### Example `ca_agents.metadata_concat` Format
+
+```text
+Agent Name: Engineering Intelligence Assistant
+Description: AI Conversational Analytics Assistant for engineering_analytics
+
+Explores:
+- Explore: engineering_analytics.issue | Label: Issues & Sprint Delivery | Description: Issue tracking, story points, cycle velocity, and SLA compliance.
+- Explore: engineering_analytics.project | Label: Strategic Projects | Description: Project roadmap and health status.
+
+Golden Queries:
+- Questions: Show engineer workload and completed story points per developer | Explore: engineering_analytics.issue | Fields: assignee.name, team.name, issue.count, issue.total_story_points, issue.completed_story_points
+- Questions: What is the status and completion progress of all strategic projects? | Explore: engineering_analytics.project | Fields: project.name, team.name, lead.name, project_status.name, project.state, project_metrics_rollup.latest_health_status, project.progress
+
+System Instructions:
+You are an expert Senior Engineering Intelligence & Delivery Analyst specializing in engineering operations...
+```
+
+#### Table 2: `ca_golden_queries` (`<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_golden_queries`)
+
+Stores one row per active Looker Golden Query, keyed on `record_id = "{agent_id}:{golden_query_id}"` and mapped to `agent_id`:
+
+```sql
+CREATE TABLE IF NOT EXISTS `<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_golden_queries` (
+  record_id STRING NOT NULL,
+  golden_query_id STRING NOT NULL,
+  agent_id STRING NOT NULL,
+  agent_name STRING,
+  agent_url STRING,
+  instance_url STRING,
+  questions ARRAY<STRING>,
+  model STRING,
+  explore STRING,
+  fields ARRAY<STRING>,
+  filters JSON,
+  sorts ARRAY<STRING>,
+  `limit` STRING,
+  answer STRING,
+  synced_at TIMESTAMP,
+  metadata_concat STRING,
+  embedding STRUCT<result ARRAY<FLOAT64>, status STRING>
+    GENERATED ALWAYS AS (
+      AI.EMBED(
+        metadata_concat,
+        connection_id => '<YOUR_GCP_PROJECT_ID>.us.ca_agent_embedding_conn',
+        endpoint => 'text-embedding-005'
+      )
+    )
+    STORED OPTIONS (asynchronous = TRUE)
+);
+```
+
+##### Example `ca_golden_queries.metadata_concat` Format
+
+```text
+Golden Query Questions: What is the status and completion progress of all strategic projects?
+Agent Name: Engineering Intelligence Assistant
+LookML Explore: engineering_analytics.project
+Fields: project.name, team.name, lead.name, project_status.name, project.state, project_metrics_rollup.latest_health_status, project.progress
+Sorts: project.progress desc
+```
+
+---
+
+### 8.2 Stage 1 SQL: Search Curated Golden Queries (`ca_golden_queries`)
+
+Downstream applications, orchestrator agents, or analysts can query the BigQuery tables directly using either **`AI.SEARCH`** (native autonomous embedding search) or **`AI.EMBED` + `ML.DISTANCE(..., 'COSINE')`**.
+
+> [!WARNING]
+> **Multi-Tenant Pre-Filtering for Direct SQL Consumers:** Because `ca_agents` and `ca_golden_queries` store the global Admin-synced agent catalog without BigQuery Row-Level Security (RLS), any direct SQL queries running on behalf of a specific Looker user **must** pass that user's accessible `agent_id` allowlist (`@allowed_agent_ids`) into `WHERE agent_id IN UNNEST(@allowed_agent_ids)` as shown below.
+
+*(Note: On unit-normalized `text-embedding-005` embeddings, `AI.SEARCH` returns Euclidean distance $L_2$, which converts directly to cosine distance via $d_{\text{cosine}} = L_2^2 / 2$ and cosine similarity via $1 - L_2^2 / 2$.)*
+
+#### Unscoped (Admin Mode)
+```sql
+SELECT
+  base.record_id,
+  base.golden_query_id,
+  base.agent_id,
+  base.agent_name,
+  base.agent_url,
+  base.questions,
+  base.model,
+  base.explore,
+  base.fields,
+  base.filters,
+  base.sorts,
+  (1.0 - POW(distance, 2) / 2.0) AS similarity_score,
+  (POW(distance, 2) / 2.0) AS distance
+FROM AI.SEARCH(
+  TABLE `<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_golden_queries`,
+  'metadata_concat',
+  'What is the status and completion progress of all strategic projects?',
+  top_k => 5
+)
+WHERE (1.0 - POW(distance, 2) / 2.0) >= 0.65
+ORDER BY distance ASC;
+```
+
+#### User-Scoped (Pre-Filtered inside `AI.SEARCH` with `@allowed_agent_ids`)
+```sql
+SELECT
+  base.record_id,
+  base.golden_query_id,
+  base.agent_id,
+  base.agent_name,
+  base.agent_url,
+  base.questions,
+  base.model,
+  base.explore,
+  base.fields,
+  base.filters,
+  base.sorts,
+  (1.0 - POW(distance, 2) / 2.0) AS similarity_score,
+  (POW(distance, 2) / 2.0) AS distance
+FROM AI.SEARCH(
+  (SELECT * FROM `<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_golden_queries` WHERE agent_id IN UNNEST(@allowed_agent_ids)),
+  'metadata_concat',
+  @query_text,
+  top_k => @top_k
+)
+WHERE (1.0 - POW(distance, 2) / 2.0) >= @confidence_score
+ORDER BY distance ASC;
+```
+
+---
+
+### 8.3 Stage 2 SQL: Candidate-Filtered & User-Scoped Agent Search (`ca_agents`)
+
+When Stage 1 returns $\ge 1$ Golden Queries above your confidence threshold (or when pre-filtering by a user's `@allowed_agent_ids`), pass the target `agent_id`s as `@matched_agent_ids` (`ARRAY<STRING>`) to filter `ca_agents`:
+
+#### Option 1: Using `AI.SEARCH` Pre-Filtered with `WHERE agent_id IN UNNEST(@matched_agent_ids)`
+
+```sql
+SELECT
+  base.agent_id,
+  base.name,
+  base.description,
+  base.agent_url,
+  base.sources,
+  (1.0 - POW(distance, 2) / 2.0) AS similarity_score,
+  (POW(distance, 2) / 2.0) AS distance
+FROM AI.SEARCH(
+  (SELECT * FROM `<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_agents` WHERE agent_id IN UNNEST(@matched_agent_ids)),
+  'metadata_concat',
+  @query_text,
+  top_k => @top_k
+)
+ORDER BY distance ASC
+LIMIT @top_k;
+```
+
+#### Option 2: Using `AI.EMBED` + `ML.DISTANCE(..., 'COSINE')` with `WHERE agent_id IN UNNEST(@matched_agent_ids)`
+
+Works even while background autonomous embedding generation is still warming up for newly synced rows:
+
+```sql
+WITH query_emb AS (
+  SELECT AI.EMBED(
+    @query_text,
+    connection_id => '<YOUR_GCP_PROJECT_ID>.us.ca_agent_embedding_conn',
+    endpoint => 'text-embedding-005'
+  ).result AS vec
+),
+candidate_agents AS (
+  SELECT
+    t.agent_id,
+    t.name,
+    t.description,
+    t.category,
+    t.agent_url,
+    t.instance_url,
+    t.sources,
+    CASE
+      WHEN t.embedding IS NOT NULL AND ARRAY_LENGTH(t.embedding.result) > 0 THEN t.embedding.result
+      ELSE AI.EMBED(
+        t.metadata_concat,
+        connection_id => '<YOUR_GCP_PROJECT_ID>.us.ca_agent_embedding_conn',
+        endpoint => 'text-embedding-005'
+      ).result
+    END AS agent_vec
+  FROM `<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_agents` AS t
+  WHERE agent_id IN UNNEST(@matched_agent_ids)
+)
+SELECT
+  c.agent_id,
+  c.name,
+  c.description,
+  c.agent_url,
+  c.sources,
+  ML.DISTANCE(c.agent_vec, q.vec, 'COSINE') AS distance,
+  (1.0 - ML.DISTANCE(c.agent_vec, q.vec, 'COSINE')) AS similarity_score
+FROM candidate_agents AS c
+CROSS JOIN query_emb AS q
+WHERE ARRAY_LENGTH(c.agent_vec) > 0
+ORDER BY distance ASC
+LIMIT @top_k;
+```
+
+---
+
+### 8.4 Single-Step / Unfiltered Fallback SQL (`ca_agents`)
+
+When running unscoped Admin single-step search or when 0 Golden Queries meet `confidence_score` in Stage 1 (in Admin mode):
+
+```sql
+SELECT
+  base.agent_id,
+  base.name,
+  base.description,
+  base.agent_url,
+  base.sources,
+  (1.0 - POW(distance, 2) / 2.0) AS similarity_score,
+  (POW(distance, 2) / 2.0) AS distance
+FROM AI.SEARCH(
+  TABLE `<YOUR_GCP_PROJECT_ID>.looker_agent_registry.ca_agents`,
+  'metadata_concat',
+  'What is our sprint velocity and SLA compliance rate for engineering issues?',
+  top_k => 3
+)
+ORDER BY distance ASC;
+```
+
+---
+
+## 9. Google Cloud APIs, IAM Roles & Troubleshooting
+
+### Required Google Cloud APIs
+
+```bash
+gcloud services enable \
+  bigquery.googleapis.com \
+  bigqueryconnection.googleapis.com \
+  aiplatform.googleapis.com \
+  cloudresourcemanager.googleapis.com \
+  --project=<YOUR_GCP_PROJECT_ID>
+```
+
+### Required IAM Roles
+
+#### 1. The Sync Runner (User or Service Account running `ca-agent-sync`)
+
+| IAM Role | Purpose |
+| :--- | :--- |
+| **`roles/bigquery.dataEditor`** | Create the `looker_agent_registry` dataset, create the `ca_agents` and `ca_golden_queries` tables, and run `MERGE` / `DELETE` statements. |
+| **`roles/bigquery.jobUser`** | Submit BigQuery DDL, DML (`MERGE` / `DELETE`), and `AI.SEARCH` / `AI.EMBED` query jobs. |
+| **`roles/bigquery.connectionAdmin`** | Create or inspect the BigQuery Cloud Resource Connection (`ca_agent_embedding_conn`), or `roles/bigquery.connectionUser` if using a pre-created connection. |
+| **`roles/resourcemanager.projectIamAdmin`** *(Optional)* | Only required if you want `ca-agent-sync init` to automatically bind `roles/aiplatform.user` to the BigQuery connection's service account. |
+
+#### 2. The BigQuery Cloud Resource Connection Service Account (`bqcx-...`)
+
+When a BigQuery Cloud Resource Connection is created, Google Cloud provisions a dedicated service account (`bqcx-<PROJECT_NUMBER>-<HASH>@gcp-sa-bigquery-condel.iam.gserviceaccount.com`). BigQuery uses this service account in the background to call Vertex AI's `text-embedding-005` model.
+
+| IAM Role | Target Principal | Purpose |
+| :--- | :--- | :--- |
+| **`roles/aiplatform.user`** *(Vertex AI User)* | `serviceAccount:bqcx-...` (Connection Service Account) | Allows BigQuery's background autonomous embedding job (`ca_agents` and `ca_golden_queries`) and `AI.EMBED` / `AI.SEARCH` calls to invoke Vertex AI embedding endpoints. |
+
+`uv run ca-agent-sync init` binds this role automatically, or an admin can grant it manually:
+
+```bash
+gcloud projects add-iam-policy-binding <YOUR_GCP_PROJECT_ID> \
+  --member="serviceAccount:<CONNECTION_SERVICE_ACCOUNT_EMAIL>" \
+  --role="roles/aiplatform.user"
+```
+
+---
+
+## 10. Exit Codes & Error Handling
 
 | Exit Code | Meaning | Example Cause |
 | :---: | :--- | :--- |
